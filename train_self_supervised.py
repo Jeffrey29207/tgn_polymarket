@@ -10,7 +10,8 @@ from pathlib import Path
 
 from evaluation.evaluation import eval_edge_prediction
 from model.tgn import TGN
-from utils.utils import EarlyStopMonitor, RandEdgeSampler, get_neighbor_finder
+from utils.utils import EarlyStopMonitor, RandEdgeSampler, TemporalTypedNegativeEdgeSampler, \
+  get_neighbor_finder
 from utils.data_processing import get_data, compute_time_statistics
 
 torch.manual_seed(0)
@@ -62,6 +63,10 @@ parser.add_argument('--use_source_embedding_in_message', action='store_true',
                     help='Whether to use the embedding of the source node as part of the message')
 parser.add_argument('--dyrep', action='store_true',
                     help='Whether to run the dyrep model')
+parser.add_argument('--negative_sampler', type=str, default="random",
+                    choices=["random", "typed_temporal"],
+                    help='Negative sampler to use. typed_temporal keeps destination node types '
+                         'compatible and avoids historical positives when possible.')
 
 
 try:
@@ -119,17 +124,43 @@ train_ngh_finder = get_neighbor_finder(train_data, args.uniform)
 # Initialize validation and test neighbor finder to retrieve temporal graph
 full_ngh_finder = get_neighbor_finder(full_data, args.uniform)
 
+node_types = None
+if args.negative_sampler == "typed_temporal":
+  # Polymarket preprocessing stores one-hot node type columns first: market, token.
+  # For older datasets this still produces a harmless coarse type id.
+  node_types = np.argmax(node_features[:, :2], axis=1) if node_features.shape[1] >= 2 else None
+
 # Initialize negative samplers. Set seeds for validation and testing so negatives are the same
 # across different runs
 # NB: in the inductive setting, negatives are sampled only amongst other new nodes
-train_rand_sampler = RandEdgeSampler(train_data.sources, train_data.destinations)
-val_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=0)
-nn_val_rand_sampler = RandEdgeSampler(new_node_val_data.sources, new_node_val_data.destinations,
-                                      seed=1)
-test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=2)
-nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.sources,
-                                       new_node_test_data.destinations,
-                                       seed=3)
+if args.negative_sampler == "typed_temporal":
+  # The typed sampler is useful for heterogeneous Polymarket graphs: it samples negatives that
+  # look structurally plausible instead of mixing market-node and token-node destinations.
+  train_rand_sampler = TemporalTypedNegativeEdgeSampler(train_data.sources, train_data.destinations,
+                                                       train_data.timestamps, node_types=node_types)
+  val_rand_sampler = TemporalTypedNegativeEdgeSampler(full_data.sources, full_data.destinations,
+                                                     full_data.timestamps, node_types=node_types,
+                                                     seed=0)
+  nn_val_rand_sampler = TemporalTypedNegativeEdgeSampler(new_node_val_data.sources,
+                                                        new_node_val_data.destinations,
+                                                        new_node_val_data.timestamps,
+                                                        node_types=node_types, seed=1)
+  test_rand_sampler = TemporalTypedNegativeEdgeSampler(full_data.sources, full_data.destinations,
+                                                      full_data.timestamps, node_types=node_types,
+                                                      seed=2)
+  nn_test_rand_sampler = TemporalTypedNegativeEdgeSampler(new_node_test_data.sources,
+                                                         new_node_test_data.destinations,
+                                                         new_node_test_data.timestamps,
+                                                         node_types=node_types, seed=3)
+else:
+  train_rand_sampler = RandEdgeSampler(train_data.sources, train_data.destinations)
+  val_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=0)
+  nn_val_rand_sampler = RandEdgeSampler(new_node_val_data.sources, new_node_val_data.destinations,
+                                        seed=1)
+  test_rand_sampler = RandEdgeSampler(full_data.sources, full_data.destinations, seed=2)
+  nn_test_rand_sampler = RandEdgeSampler(new_node_test_data.sources,
+                                         new_node_test_data.destinations,
+                                         seed=3)
 
 # Set device
 device_string = 'cuda:{}'.format(GPU) if torch.cuda.is_available() else 'cpu'
@@ -210,7 +241,13 @@ for i in range(args.n_runs):
         timestamps_batch = train_data.timestamps[start_idx:end_idx]
 
         size = len(sources_batch)
-        _, negatives_batch = train_rand_sampler.sample(size)
+        # typed_temporal needs the positive destination and timestamp to avoid historical positives.
+        # The default sampler ignores those details and preserves the original TGN behavior.
+        if hasattr(train_rand_sampler, "sample_for_batch"):
+          _, negatives_batch = train_rand_sampler.sample_for_batch(sources_batch, destinations_batch,
+                                                                   timestamps_batch)
+        else:
+          _, negatives_batch = train_rand_sampler.sample(size)
 
         with torch.no_grad():
           pos_label = torch.ones(size, dtype=torch.float, device=device)

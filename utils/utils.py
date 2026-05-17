@@ -88,6 +88,111 @@ class RandEdgeSampler(object):
     self.random_state = np.random.RandomState(self.seed)
 
 
+class TemporalTypedNegativeEdgeSampler(object):
+  """
+  Negative sampler for temporal heterogeneous graphs.
+
+  The original sampler draws destinations uniformly from all destination nodes. That is fine for
+  simple bipartite benchmarks, but it can be too easy for Polymarket graphs: replacing a token
+  node with a market node, for example, creates an obviously invalid negative. This sampler can
+  keep negatives type-compatible and avoid edges that were already observed before the query time.
+  """
+  def __init__(self, src_list, dst_list, timestamps=None, node_types=None, seed=None,
+               avoid_historical_edges=True):
+    self.seed = seed
+    self.random_state = np.random.RandomState(seed) if seed is not None else np.random
+    self.src_list = np.asarray(src_list)
+    self.dst_list = np.asarray(dst_list)
+    self.timestamps = np.asarray(timestamps) if timestamps is not None else None
+    self.node_types = np.asarray(node_types) if node_types is not None else None
+    self.avoid_historical_edges = avoid_historical_edges
+
+    self.unique_src = np.unique(self.src_list)
+    self.unique_dst = np.unique(self.dst_list)
+    self.type_to_dst = {}
+
+    # Group destination candidates by node type. For Polymarket this prevents easy negatives like
+    # replacing an outcome token destination with a market node destination.
+    if self.node_types is not None:
+      for dst in self.unique_dst:
+        node_type = self.node_types[dst]
+        self.type_to_dst.setdefault(node_type, []).append(dst)
+      self.type_to_dst = {
+        node_type: np.asarray(nodes, dtype=self.unique_dst.dtype)
+        for node_type, nodes in self.type_to_dst.items()
+      }
+
+    self.edge_timestamps = {}
+    if timestamps is not None:
+      # Store historical edge times so batch sampling can reject negatives that were already
+      # positive before the current query time.
+      for src, dst, ts in zip(self.src_list, self.dst_list, self.timestamps):
+        self.edge_timestamps.setdefault((src, dst), []).append(ts)
+      for edge, edge_times in self.edge_timestamps.items():
+        self.edge_timestamps[edge] = np.sort(np.asarray(edge_times))
+
+  def _candidate_destinations(self, positive_dst):
+    if self.node_types is None:
+      return self.unique_dst
+    node_type = self.node_types[positive_dst]
+    return self.type_to_dst.get(node_type, self.unique_dst)
+
+  def _edge_seen_before(self, src, dst, timestamp):
+    if not self.avoid_historical_edges or self.timestamps is None:
+      return False
+    edge_times = self.edge_timestamps.get((src, dst))
+    if edge_times is None:
+      return False
+    return np.searchsorted(edge_times, timestamp, side="left") > 0
+
+  def _sample_one_destination(self, src, positive_dst=None, timestamp=None, max_attempts=100):
+    candidates = self._candidate_destinations(positive_dst) if positive_dst is not None else self.unique_dst
+    if len(candidates) == 0:
+      candidates = self.unique_dst
+
+    for _ in range(max_attempts):
+      sampled_dst = candidates[self.random_state.randint(0, len(candidates))]
+      if positive_dst is not None and sampled_dst == positive_dst:
+        continue
+      if src is not None and timestamp is not None and self._edge_seen_before(src, sampled_dst, timestamp):
+        continue
+      return sampled_dst
+
+    # Dense subgraphs can make rejection sampling difficult; return any type-compatible non-self
+    # destination as a pragmatic fallback.
+    fallback = candidates[self.random_state.randint(0, len(candidates))]
+    if positive_dst is not None and len(candidates) > 1:
+      while fallback == positive_dst:
+        fallback = candidates[self.random_state.randint(0, len(candidates))]
+    return fallback
+
+  def sample(self, size, sources=None, destinations=None, timestamps=None):
+    # Keep the original RandEdgeSampler-compatible mode for callers that only pass a size.
+    if sources is None or destinations is None or timestamps is None:
+      src_index = self.random_state.randint(0, len(self.unique_src), size)
+      sampled_src = self.unique_src[src_index]
+      sampled_dst = np.asarray([
+        self._sample_one_destination(None)
+        for _ in range(size)
+      ])
+      return sampled_src, sampled_dst
+
+    sampled_dst = np.asarray([
+      self._sample_one_destination(src, dst, ts)
+      for src, dst, ts in zip(sources, destinations, timestamps)
+    ])
+    return np.asarray(sources), sampled_dst
+
+  def sample_for_batch(self, sources, destinations, timestamps):
+    # Training/evaluation code calls this path when it wants type-compatible, time-aware negatives.
+    return self.sample(len(sources), sources=sources, destinations=destinations,
+                       timestamps=timestamps)
+
+  def reset_random_state(self):
+    if self.seed is not None:
+      self.random_state = np.random.RandomState(self.seed)
+
+
 def get_neighbor_finder(data, uniform, max_node_idx=None):
   max_node_idx = max(data.sources.max(), data.destinations.max()) if max_node_idx is None else max_node_idx
   adj_list = [[] for _ in range(max_node_idx + 1)]
