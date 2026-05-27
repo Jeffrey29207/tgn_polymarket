@@ -91,6 +91,9 @@ def score_temporal_edges(model, sources, destinations, timestamps, edge_idxs, n_
   markets/outcomes may be dependent" rather than "this observed edge should update node memory".
   By default the function restores model memory after every batch so scoring hypothetical
   candidates does not contaminate subsequent scores.
+
+  Inputs are parallel arrays of source node ids, destination node ids, timestamps, and edge feature
+  indices. The function returns one probability-like TGN affinity score per candidate edge.
   """
   scores = np.zeros(len(sources), dtype=np.float32)
   num_instance = len(sources)
@@ -126,7 +129,12 @@ def score_temporal_edges(model, sources, destinations, timestamps, edge_idxs, n_
 
 
 def ranking_metrics(labels, scores, k_values=(10, 50, 100)):
-  """Ranking metrics for dependency candidate retrieval."""
+  """Compute retrieval metrics from binary labels and model scores.
+
+  AP/AUC measure global ranking quality. MRR and precision/recall@K measure whether useful
+  candidate dependencies appear near the top of the list, which is the more important behavior
+  when the next stage is expensive symbolic verification.
+  """
   labels = np.asarray(labels).astype(np.float32)
   scores = np.asarray(scores).astype(np.float32)
   order = np.argsort(-scores)
@@ -163,6 +171,9 @@ def eval_polymarket_candidate_ranking(model, candidate_data, n_neighbors, batch_
   candidate_data should expose the same attributes as utils.data_processing.Data:
   sources, destinations, timestamps, edge_idxs, and labels. Labels are interpreted as
   dependency positives/negatives, not market resolution labels.
+
+  The return value is a metrics dictionary plus a "scores" array. Keeping scores lets you inspect
+  individual candidates or join results back to metadata after evaluation.
   """
   scores = score_temporal_edges(model=model,
                                 sources=candidate_data.sources,
@@ -181,6 +192,10 @@ def rank_polymarket_candidates(model, sources, destinations, timestamps, edge_id
                                batch_size=200, mutate_memory=False, top_k=100):
   """
   Return top-k scored candidate edges for manual inspection or symbolic verification.
+
+  This is the inference-oriented companion to eval_polymarket_candidate_ranking. It does not need
+  labels; it simply scores candidate edges and returns dictionaries containing the node ids,
+  timestamp, edge feature id, and model score for the highest-ranked candidates.
   """
   scores = score_temporal_edges(model=model,
                                 sources=np.asarray(sources),

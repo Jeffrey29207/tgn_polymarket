@@ -49,8 +49,9 @@ parser.add_argument('--aggregator', type=str, default="last", help='Type of mess
 parser.add_argument('--memory_update_at_end', action='store_true',
                     help='Whether to update memory at the end or at the start of the batch')
 parser.add_argument('--message_dim', type=int, default=100, help='Dimensions of the messages')
-parser.add_argument('--memory_dim', type=int, default=172, help='Dimensions of the memory for '
-                                                                'each user')
+parser.add_argument('--memory_dim', type=int, default=None, help='Dimensions of the memory for '
+                                                                'each node. Defaults to the node '
+                                                                'feature dimension.')
 parser.add_argument('--different_new_nodes', action='store_true',
                     help='Whether to use disjoint set of new nodes for train and val')
 parser.add_argument('--uniform', action='store_true',
@@ -65,6 +66,9 @@ parser.add_argument('--n_neg', type=int, default=1)
 parser.add_argument('--use_validation', action='store_true',
                     help='Whether to use a validation set')
 parser.add_argument('--new_node', action='store_true', help='model new node')
+parser.add_argument('--strict_memory_check', action='store_true',
+                    help='Fail if the temporary and persisted memory update paths differ. '
+                         'By default, training logs the drift and aligns persisted memory.')
 
 try:
   args = parser.parse_args()
@@ -118,6 +122,17 @@ logger.info(args)
 full_data, node_features, edge_features, train_data, val_data, test_data = \
   get_data_node_classification(DATA, use_validation=args.use_validation)
 
+if MEMORY_DIM is None:
+  MEMORY_DIM = node_features.shape[1]
+  print(f"[setup] --memory_dim not provided; using node feature dimension {MEMORY_DIM}",
+        flush=True)
+elif USE_MEMORY and MEMORY_DIM != node_features.shape[1]:
+  raise ValueError(
+    "This TGN implementation adds node memory to raw node features, so --memory_dim must match "
+    f"the node feature dimension. Got memory_dim={MEMORY_DIM}, "
+    f"node_dim={node_features.shape[1]}. Rerun with --memory_dim {node_features.shape[1]}."
+  )
+
 max_idx = max(full_data.unique_nodes)
 
 train_ngh_finder = get_neighbor_finder(train_data, uniform=UNIFORM, max_node_idx=max_idx)
@@ -149,7 +164,8 @@ for i in range(args.n_runs):
             mean_time_shift_src=mean_time_shift_src, std_time_shift_src=std_time_shift_src,
             mean_time_shift_dst=mean_time_shift_dst, std_time_shift_dst=std_time_shift_dst,
             use_destination_embedding_in_message=args.use_destination_embedding_in_message,
-            use_source_embedding_in_message=args.use_source_embedding_in_message)
+            use_source_embedding_in_message=args.use_source_embedding_in_message,
+            strict_memory_check=args.strict_memory_check)
 
   tgn = tgn.to(device)
 

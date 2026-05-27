@@ -99,6 +99,12 @@ class TemporalTypedNegativeEdgeSampler(object):
   """
   def __init__(self, src_list, dst_list, timestamps=None, node_types=None, seed=None,
                avoid_historical_edges=True):
+    """Create lookup tables used for fast negative sampling.
+
+    src_list, dst_list, and timestamps describe the observed positive temporal edges. node_types
+    is an optional array indexed by node id; when present, each negative destination is sampled
+    from the same node type as the positive destination.
+    """
     self.seed = seed
     self.random_state = np.random.RandomState(seed) if seed is not None else np.random
     self.src_list = np.asarray(src_list)
@@ -132,12 +138,14 @@ class TemporalTypedNegativeEdgeSampler(object):
         self.edge_timestamps[edge] = np.sort(np.asarray(edge_times))
 
   def _candidate_destinations(self, positive_dst):
+    """Return the destination pool that matches the positive destination's node type."""
     if self.node_types is None:
       return self.unique_dst
     node_type = self.node_types[positive_dst]
     return self.type_to_dst.get(node_type, self.unique_dst)
 
   def _edge_seen_before(self, src, dst, timestamp):
+    """Check whether (src, dst) was already a positive edge before timestamp."""
     if not self.avoid_historical_edges or self.timestamps is None:
       return False
     edge_times = self.edge_timestamps.get((src, dst))
@@ -146,6 +154,12 @@ class TemporalTypedNegativeEdgeSampler(object):
     return np.searchsorted(edge_times, timestamp, side="left") > 0
 
   def _sample_one_destination(self, src, positive_dst=None, timestamp=None, max_attempts=100):
+    """Sample one plausible negative destination for a positive edge.
+
+    The sampler first tries rejection sampling: same destination type, not the real destination,
+    and not an already-seen positive historical edge. If the graph is too dense for that to work
+    quickly, it falls back to a type-compatible destination so training can continue.
+    """
     candidates = self._candidate_destinations(positive_dst) if positive_dst is not None else self.unique_dst
     if len(candidates) == 0:
       candidates = self.unique_dst
@@ -167,6 +181,12 @@ class TemporalTypedNegativeEdgeSampler(object):
     return fallback
 
   def sample(self, size, sources=None, destinations=None, timestamps=None):
+    """Sample a batch of negative destinations.
+
+    When only size is supplied, this behaves like the original RandEdgeSampler and ignores
+    temporal/type context. When sources, destinations, and timestamps are supplied, it returns
+    context-aware negatives aligned with the positive batch.
+    """
     # Keep the original RandEdgeSampler-compatible mode for callers that only pass a size.
     if sources is None or destinations is None or timestamps is None:
       src_index = self.random_state.randint(0, len(self.unique_src), size)
@@ -184,11 +204,13 @@ class TemporalTypedNegativeEdgeSampler(object):
     return np.asarray(sources), sampled_dst
 
   def sample_for_batch(self, sources, destinations, timestamps):
+    """Convenience wrapper used by train/evaluation loops for positive-edge batches."""
     # Training/evaluation code calls this path when it wants type-compatible, time-aware negatives.
     return self.sample(len(sources), sources=sources, destinations=destinations,
                        timestamps=timestamps)
 
   def reset_random_state(self):
+    """Reset deterministic sampling for validation/test reproducibility."""
     if self.seed is not None:
       self.random_state = np.random.RandomState(self.seed)
 

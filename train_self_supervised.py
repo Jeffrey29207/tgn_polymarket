@@ -49,8 +49,9 @@ parser.add_argument('--aggregator', type=str, default="last", help='Type of mess
 parser.add_argument('--memory_update_at_end', action='store_true',
                     help='Whether to update memory at the end or at the start of the batch')
 parser.add_argument('--message_dim', type=int, default=100, help='Dimensions of the messages')
-parser.add_argument('--memory_dim', type=int, default=172, help='Dimensions of the memory for '
-                                                                'each user')
+parser.add_argument('--memory_dim', type=int, default=None, help='Dimensions of the memory for '
+                                                                'each node. Defaults to the node '
+                                                                'feature dimension.')
 parser.add_argument('--different_new_nodes', action='store_true',
                     help='Whether to use disjoint set of new nodes for train and val')
 parser.add_argument('--uniform', action='store_true',
@@ -67,6 +68,11 @@ parser.add_argument('--negative_sampler', type=str, default="random",
                     choices=["random", "typed_temporal"],
                     help='Negative sampler to use. typed_temporal keeps destination node types '
                          'compatible and avoids historical positives when possible.')
+parser.add_argument('--progress_every_batches', type=int, default=50,
+                    help='Print training progress every N optimizer steps. Use 0 to disable.')
+parser.add_argument('--strict_memory_check', action='store_true',
+                    help='Fail if the temporary and persisted memory update paths differ. '
+                         'By default, training logs the drift and aligns persisted memory.')
 
 
 try:
@@ -112,23 +118,47 @@ ch.setFormatter(formatter)
 logger.addHandler(fh)
 logger.addHandler(ch)
 logger.info(args)
+print(f"[setup] Arguments parsed for dataset={args.data}, prefix={args.prefix}", flush=True)
 
 ### Extract data for training, validation and testing
+print(f"[data] Loading dataset {DATA} from ./data/ml_{DATA}.*", flush=True)
 node_features, edge_features, full_data, train_data, val_data, test_data, new_node_val_data, \
 new_node_test_data = get_data(DATA,
                               different_new_nodes_between_val_and_test=args.different_new_nodes, randomize_features=args.randomize_features)
+print("[data] Loaded "
+      f"nodes={node_features.shape[0]}, node_dim={node_features.shape[1]}, "
+      f"edge_features={edge_features.shape}, interactions={full_data.n_interactions}",
+      flush=True)
+print("[data] Split sizes "
+      f"train={train_data.n_interactions}, val={val_data.n_interactions}, "
+      f"test={test_data.n_interactions}, new_val={new_node_val_data.n_interactions}, "
+      f"new_test={new_node_test_data.n_interactions}",
+      flush=True)
+
+if MEMORY_DIM is None:
+  MEMORY_DIM = node_features.shape[1]
+  print(f"[setup] --memory_dim not provided; using node feature dimension {MEMORY_DIM}",
+        flush=True)
+elif USE_MEMORY and MEMORY_DIM != node_features.shape[1]:
+  raise ValueError(
+    "This TGN implementation adds node memory to raw node features, so --memory_dim must match "
+    f"the node feature dimension. Got memory_dim={MEMORY_DIM}, "
+    f"node_dim={node_features.shape[1]}. Rerun with --memory_dim {node_features.shape[1]}."
+  )
 
 # Initialize training neighbor finder to retrieve temporal graph
+print("[neighbors] Building training neighbor finder", flush=True)
 train_ngh_finder = get_neighbor_finder(train_data, args.uniform)
 
 # Initialize validation and test neighbor finder to retrieve temporal graph
+print("[neighbors] Building full neighbor finder", flush=True)
 full_ngh_finder = get_neighbor_finder(full_data, args.uniform)
 
 node_types = None
 if args.negative_sampler == "typed_temporal":
-  # Polymarket preprocessing stores one-hot node type columns first: market, token.
+  # Polymarket preprocessing stores one-hot node type columns first: market, token, topic.
   # For older datasets this still produces a harmless coarse type id.
-  node_types = np.argmax(node_features[:, :2], axis=1) if node_features.shape[1] >= 2 else None
+  node_types = np.argmax(node_features[:, :3], axis=1) if node_features.shape[1] >= 3 else None
 
 # Initialize negative samplers. Set seeds for validation and testing so negatives are the same
 # across different runs
@@ -165,14 +195,21 @@ else:
 # Set device
 device_string = 'cuda:{}'.format(GPU) if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_string)
+print(f"[device] Using {device}", flush=True)
 
 # Compute time statistics
+print("[time] Computing time-delta normalization statistics", flush=True)
 mean_time_shift_src, std_time_shift_src, mean_time_shift_dst, std_time_shift_dst = \
   compute_time_statistics(full_data.sources, full_data.destinations, full_data.timestamps)
+print("[time] Stats "
+      f"src_mean={mean_time_shift_src:.4f}, src_std={std_time_shift_src:.4f}, "
+      f"dst_mean={mean_time_shift_dst:.4f}, dst_std={std_time_shift_dst:.4f}",
+      flush=True)
 
 for i in range(args.n_runs):
   results_path = "results/{}_{}.pkl".format(args.prefix, i) if i > 0 else "results/{}.pkl".format(args.prefix)
   Path("results/").mkdir(parents=True, exist_ok=True)
+  print(f"[run {i + 1}/{args.n_runs}] Initializing TGN model", flush=True)
 
   # Initialize Model
   tgn = TGN(neighbor_finder=train_ngh_finder, node_features=node_features,
@@ -190,7 +227,8 @@ for i in range(args.n_runs):
             mean_time_shift_dst=mean_time_shift_dst, std_time_shift_dst=std_time_shift_dst,
             use_destination_embedding_in_message=args.use_destination_embedding_in_message,
             use_source_embedding_in_message=args.use_source_embedding_in_message,
-            dyrep=args.dyrep)
+            dyrep=args.dyrep,
+            strict_memory_check=args.strict_memory_check)
   criterion = torch.nn.BCELoss()
   optimizer = torch.optim.Adam(tgn.parameters(), lr=LEARNING_RATE)
   tgn = tgn.to(device)
@@ -200,6 +238,8 @@ for i in range(args.n_runs):
 
   logger.info('num of training instances: {}'.format(num_instance))
   logger.info('num of batches per epoch: {}'.format(num_batch))
+  print(f"[run {i + 1}/{args.n_runs}] Training instances={num_instance}, "
+        f"batches_per_epoch={num_batch}, batch_size={BATCH_SIZE}", flush=True)
   idx_list = np.arange(num_instance)
 
   new_nodes_val_aps = []
@@ -212,6 +252,7 @@ for i in range(args.n_runs):
   for epoch in range(NUM_EPOCH):
     start_epoch = time.time()
     ### Training
+    print(f"[epoch {epoch + 1}/{NUM_EPOCH}] Starting training", flush=True)
 
     # Reinitialize memory of the model at the start of each epoch
     if USE_MEMORY:
@@ -223,6 +264,9 @@ for i in range(args.n_runs):
 
     logger.info('start {} epoch'.format(epoch))
     for k in range(0, num_batch, args.backprop_every):
+      progress_step = (k // args.backprop_every) + 1
+      progress_total = math.ceil(num_batch / args.backprop_every)
+      progress_start_time = time.time()
       loss = 0
       optimizer.zero_grad()
 
@@ -264,6 +308,18 @@ for i in range(args.n_runs):
       loss.backward()
       optimizer.step()
       m_loss.append(loss.item())
+      if args.progress_every_batches > 0 and (
+          progress_step == 1 or progress_step % args.progress_every_batches == 0 or
+          k + args.backprop_every >= num_batch):
+        seen_instances = min(num_instance, (k + args.backprop_every) * BATCH_SIZE)
+        elapsed_epoch = time.time() - start_epoch
+        print(f"[epoch {epoch + 1}/{NUM_EPOCH}] "
+              f"batch_step={progress_step}/{progress_total}, "
+              f"seen={seen_instances}/{num_instance}, "
+              f"loss={loss.item():.6f}, "
+              f"step_time={time.time() - progress_start_time:.2f}s, "
+              f"epoch_elapsed={elapsed_epoch:.1f}s",
+              flush=True)
 
       # Detach memory after 'args.backprop_every' number of batches so we don't backpropagate to
       # the start of time
@@ -275,6 +331,8 @@ for i in range(args.n_runs):
 
     ### Validation
     # Validation uses the full graph
+    print(f"[epoch {epoch + 1}/{NUM_EPOCH}] Training done in {epoch_time:.1f}s; "
+          "starting validation", flush=True)
     tgn.set_neighbor_finder(full_ngh_finder)
 
     if USE_MEMORY:
@@ -286,6 +344,8 @@ for i in range(args.n_runs):
                                                             negative_edge_sampler=val_rand_sampler,
                                                             data=val_data,
                                                             n_neighbors=NUM_NEIGHBORS)
+    print(f"[epoch {epoch + 1}/{NUM_EPOCH}] Validation old-node "
+          f"AP={val_ap:.6f}, AUC={val_auc:.6f}", flush=True)
     if USE_MEMORY:
       val_memory_backup = tgn.memory.backup_memory()
       # Restore memory we had at the end of training to be used when validating on new nodes.
@@ -298,6 +358,8 @@ for i in range(args.n_runs):
                                                                         negative_edge_sampler=val_rand_sampler,
                                                                         data=new_node_val_data,
                                                                         n_neighbors=NUM_NEIGHBORS)
+    print(f"[epoch {epoch + 1}/{NUM_EPOCH}] Validation new-node "
+          f"AP={nn_val_ap:.6f}, AUC={nn_val_auc:.6f}", flush=True)
 
     if USE_MEMORY:
       # Restore memory we had at the end of validation
@@ -328,6 +390,8 @@ for i in range(args.n_runs):
 
     # Early stopping
     if early_stopper.early_stop_check(val_ap):
+      print(f"[epoch {epoch + 1}/{NUM_EPOCH}] Early stopping triggered; "
+            f"loading epoch {early_stopper.best_epoch}", flush=True)
       logger.info('No improvement over {} epochs, stop training'.format(early_stopper.max_round))
       logger.info(f'Loading the best model at epoch {early_stopper.best_epoch}')
       best_model_path = get_checkpoint_path(early_stopper.best_epoch)
@@ -337,6 +401,8 @@ for i in range(args.n_runs):
       break
     else:
       torch.save(tgn.state_dict(), get_checkpoint_path(epoch))
+      print(f"[epoch {epoch + 1}/{NUM_EPOCH}] Saved checkpoint {get_checkpoint_path(epoch)}",
+            flush=True)
 
   # Training has finished, we have loaded the best model, and we want to backup its current
   # memory (which has seen validation edges) so that it can also be used when testing on unseen
@@ -345,6 +411,7 @@ for i in range(args.n_runs):
     val_memory_backup = tgn.memory.backup_memory()
 
   ### Test
+  print(f"[run {i + 1}/{args.n_runs}] Starting test evaluation", flush=True)
   tgn.embedding_module.neighbor_finder = full_ngh_finder
   test_ap, test_auc = eval_edge_prediction(model=tgn,
                                                               negative_edge_sampler=test_rand_sampler,
@@ -376,6 +443,9 @@ for i in range(args.n_runs):
   }, open(results_path, "wb"))
 
   logger.info('Saving TGN model')
+  print(f"[run {i + 1}/{args.n_runs}] Test old-node AP={test_ap:.6f}, AUC={test_auc:.6f}; "
+        f"new-node AP={nn_test_ap:.6f}, AUC={nn_test_auc:.6f}", flush=True)
+  print(f"[run {i + 1}/{args.n_runs}] Saving model to {MODEL_SAVE_PATH}", flush=True)
   if USE_MEMORY:
     # Restore memory at the end of validation (save a model which is ready for testing)
     tgn.memory.restore_memory(val_memory_backup)
