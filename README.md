@@ -1,187 +1,266 @@
-# TGN: Temporal Graph Networks [[arXiv](https://arxiv.org/abs/2006.10637), [YouTube](https://www.youtube.com/watch?v=W1GvX2ZcUmY), [Blog Post](https://towardsdatascience.com/temporal-graph-networks-ab8f327f2efe)] 
+# Temporal Graph Learning for Polymarket Arbitrage Research
 
-Dynamic Graph             |  TGN	
-:-------------------------:|:-------------------------:	
-![](figures/dynamic_graph.png)  |  ![](figures/tgn.png)	
+This repository adapts the Temporal Graph Network (TGN) codebase for a research project on
+discovering logical and price-based arbitrage candidates in Polymarket prediction markets.
 
+The project treats Polymarket as a temporal heterogeneous graph. Markets, outcome tokens, and
+optional topics are nodes; OHLCV observations, complementary outcomes, topic membership, verified
+logical dependencies, and price co-movement candidates are timestamped edges. A TGN model is then
+trained to produce temporal embeddings and link scores that can help rank candidate relationships
+for downstream symbolic verification.
 
+The original TGN implementation is from:
 
+> Temporal Graph Networks for Deep Learning on Dynamic Graphs  
+> Emanuele Rossi, Ben Chamberlain, Fabrizio Frasca, Davide Eynard, Federico Monti, Michael Bronstein
 
-## Introduction
+## Research Goal
 
-Despite the plethora of different models for deep learning on graphs, few approaches have been proposed thus far for dealing with graphs that present some sort of dynamic nature (e.g. evolving features or connectivity over time).
- 
-In this paper, we present Temporal Graph Networks (TGNs), a generic, efficient framework for deep learning on dynamic graphs represented as sequences of timed events. Thanks to a novel combination of memory modules and graph-based operators, TGNs are able to significantly outperform previous approaches being at the same time more computationally efficient. 
+The intended research workflow is:
 
-We furthermore show that several previous models for learning on dynamic graphs can be cast as specific instances of our framework. We perform a detailed ablation study of different components of our framework and devise the best configuration that achieves state-of-the-art performance on several transductive and inductive prediction tasks for dynamic graphs.
+1. Convert raw Polymarket data into a temporal graph.
+2. Learn node and edge dynamics from market price histories.
+3. Use symbolic verifier outputs as trusted labels for logical relationships where available.
+4. Rank unseen market-market or token-token pairs as arbitrage candidates.
+5. Inspect high-scoring candidates with domain logic and symbolic checks.
 
+The model is not itself the source of truth for logical arbitrage. It is a candidate discovery and
+ranking component. Symbolic verification should remain the authority for whether a relationship is
+logically valid.
 
-#### Paper link: [Temporal Graph Networks for Deep Learning on Dynamic Graphs](https://arxiv.org/abs/2006.10637)
+## Graph Design
 
+The Polymarket-specific preprocessing code builds graph objects such as:
 
-## Running the experiments
+- `market:<condition_id>`: one market node per Polymarket condition id.
+- `token:<clob_token_id>`: one outcome token node per tradeable CLOB token.
+- `topic:<topic_key>`: optional coarse event/topic nodes inferred from question text.
 
-### Requirements
+The main edge types are:
 
-Dependencies (with python >= 3.7):
+- `market -> token`: OHLCV observation edges. These carry open, high, low, close, volume, returns,
+  market liquidity, time-to-end, and optional orderbook features.
+- `token:YES -> token:NO`: optional complement edges for binary markets.
+- `topic -> market`: optional topic membership edges.
+- `market -> market`: optional dependency edges from a symbolic verifier CSV.
+- `token -> token`: optional verifier dependency edges or correlation/co-movement candidate edges.
 
-```{bash}
-pandas==1.1.0
-torch==1.6.0
-scikit_learn==0.23.1
+Important detail: OHLCV features are stored on temporal edges, not on token nodes. Token nodes carry
+static identity/type features, while each edge records what happened at a particular timestamp.
+
+## Raw Data Expected
+
+The preprocessor expects a Polymarket data root similar to:
+
+```text
+C:/Users/User/Downloads/poly_data/
+  markets/*.parquet
+  data/freqtrade_pair_mapping.csv
+  data/data/*.feather
+  polymarket_orderbooks-002.jsonl        optional
+  polymarket_markets_1y.jsonl            optional fallback
 ```
 
-### Dataset and Preprocessing
+The key files are:
 
-#### Download the public data
-Download the sample datasets (eg. wikipedia and reddit) from
-[here](http://snap.stanford.edu/jodie/) and store their csv files in a folder named
-```data/```.
+- `markets/*.parquet`: market metadata, including `condition_id`, `question`, `outcomes`,
+  `clob_token_ids`, `volume`, `liquidity`, `created_at`, and `end_date`.
+- `data/freqtrade_pair_mapping.csv`: maps each sanitized OHLCV filename back to the original
+  `condition_id`.
+- `data/data/*.feather`: OHLCV time series for individual market outcome tokens.
 
-#### Preprocess the data
-We use the dense `npy` format to save the features in binary format. If edge features or nodes 
-features are absent, they will be replaced by a vector of zeros. 
-```{bash}
-python utils/preprocess_data.py --data wikipedia --bipartite
-python utils/preprocess_data.py --data reddit --bipartite
+The OHLCV-to-token assignment is deterministic: filename -> condition id -> market metadata ->
+outcome label -> CLOB token id. The code strips date/version/USDC/timeframe suffixes before matching
+the filename to the real outcome labels in market metadata.
+
+## Setup
+
+From the parent folder:
+
+```powershell
+cd C:\Users\User\Downloads\tgn\tgn_polymarket
+..\.venv\Scripts\python.exe --version
 ```
 
+Core dependencies include:
 
-
-### Model Training
-
-Self-supervised learning using the link prediction task:
-```{bash}
-# TGN-attn: Supervised learning on the wikipedia dataset
-python train_self_supervised.py --use_memory --prefix tgn-attn --n_runs 10
-
-# TGN-attn-reddit: Supervised learning on the reddit dataset
-python train_self_supervised.py -d reddit --use_memory --prefix tgn-attn-reddit --n_runs 10
+```text
+numpy
+pandas
+pyarrow
+scikit-learn
+torch
 ```
 
-Supervised learning on dynamic node classification (this requires a trained model from 
-the self-supervised task, by eg. running the commands above):
-```{bash}
-# TGN-attn: self-supervised learning on the wikipedia dataset
-python train_supervised.py --use_memory --prefix tgn-attn --n_runs 10
+## Preprocessing
 
-# TGN-attn-reddit: self-supervised learning on the reddit dataset
-python train_supervised.py -d reddit --use_memory --prefix tgn-attn-reddit --n_runs 10
+Small smoke-test graph:
+
+```powershell
+..\.venv\Scripts\python.exe utils\preprocess_polymarket.py `
+  --data-root C:/Users/User/Downloads/poly_data `
+  --output-dir ./data `
+  --output-name polymarket_sample `
+  --timeframe 4h `
+  --min-market-volume 10000 `
+  --max-feather-files 50 `
+  --progress-every 10 `
+  --include-topic-edges `
+  --include-complement-edges
 ```
 
-### Baselines
+Practical capped graph:
 
-```{bash}
-### Wikipedia Self-supervised
-
-# Jodie
-python train_self_supervised.py --use_memory --memory_updater rnn --embedding_module time --prefix jodie_rnn --n_runs 10
-
-# DyRep
-python train_self_supervised.py --use_memory --memory_updater rnn --dyrep --use_destination_embedding_in_message --prefix dyrep_rnn --n_runs 10
-
-
-### Reddit Self-supervised
-
-# Jodie
-python train_self_supervised.py -d reddit --use_memory --memory_updater rnn --embedding_module time --prefix jodie_rnn_reddit --n_runs 10
-
-# DyRep
-python train_self_supervised.py -d reddit --use_memory --memory_updater rnn --dyrep --use_destination_embedding_in_message --prefix dyrep_rnn_reddit --n_runs 10
-
-
-### Wikipedia Supervised
-
-# Jodie
-python train_supervised.py --use_memory --memory_updater rnn --embedding_module time --prefix jodie_rnn --n_runs 10
-
-# DyRep
-python train_supervised.py --use_memory --memory_updater rnn --dyrep --use_destination_embedding_in_message --prefix dyrep_rnn --n_runs 10
-
-
-### Reddit Supervised
-
-# Jodie
-python train_supervised.py -d reddit --use_memory --memory_updater rnn --embedding_module time --prefix jodie_rnn_reddit --n_runs 10
-
-# DyRep
-python train_supervised.py -d reddit --use_memory --memory_updater rnn  --dyrep --use_destination_embedding_in_message --prefix dyrep_rnn_reddit --n_runs 10
+```powershell
+..\.venv\Scripts\python.exe utils\preprocess_polymarket.py `
+  --data-root C:/Users/User/Downloads/poly_data `
+  --output-dir ./data `
+  --output-name polymarket_4h `
+  --timeframe 4h `
+  --min-market-volume 10000 `
+  --max-edge-rows 1000000 `
+  --progress-every 100
 ```
 
+Richer graph with topic and complement edges:
 
-### Ablation Study
-Commands to replicate all results in the ablation study over different modules:
-```{bash}
-# TGN-2l
-python train_self_supervised.py --use_memory --n_layer 2 --prefix tgn-2l --n_runs 10 
-
-# TGN-no-mem
-python train_self_supervised.py --prefix tgn-no-mem --n_runs 10 
-
-# TGN-time
-python train_self_supervised.py --use_memory --embedding_module time --prefix tgn-time --n_runs 10 
-
-# TGN-id
-python train_self_supervised.py --use_memory --embedding_module identity --prefix tgn-id --n_runs 10
-
-# TGN-sum
-python train_self_supervised.py --use_memory --embedding_module graph_sum --prefix tgn-sum --n_runs 10
-
-# TGN-mean
-python train_self_supervised.py --use_memory --aggregator mean --prefix tgn-mean --n_runs 10
+```powershell
+..\.venv\Scripts\python.exe utils\preprocess_polymarket.py `
+  --data-root C:/Users/User/Downloads/poly_data `
+  --output-dir ./data `
+  --output-name polymarket_4h_rich `
+  --timeframe 4h `
+  --min-market-volume 10000 `
+  --max-edge-rows 1000000 `
+  --progress-every 100 `
+  --include-topic-edges `
+  --include-complement-edges
 ```
 
+With symbolic verifier labels:
 
-#### General flags
-
-```{txt}
-optional arguments:
-  -d DATA, --data DATA         Data sources to use (wikipedia or reddit)
-  --bs BS                      Batch size
-  --prefix PREFIX              Prefix to name checkpoints and results
-  --n_degree N_DEGREE          Number of neighbors to sample at each layer
-  --n_head N_HEAD              Number of heads used in the attention layer
-  --n_epoch N_EPOCH            Number of epochs
-  --n_layer N_LAYER            Number of graph attention layers
-  --lr LR                      Learning rate
-  --patience                   Patience of the early stopping strategy
-  --n_runs                     Number of runs (compute mean and std of results)
-  --drop_out DROP_OUT          Dropout probability
-  --gpu GPU                    Idx for the gpu to use
-  --node_dim NODE_DIM          Dimensions of the node embedding
-  --time_dim TIME_DIM          Dimensions of the time embedding
-  --use_memory                 Whether to use a memory for the nodes
-  --embedding_module           Type of the embedding module
-  --message_function           Type of the message function
-  --memory_updater             Type of the memory updater
-  --aggregator                 Type of the message aggregator
-  --memory_update_at_the_end   Whether to update the memory at the end or at the start of the batch
-  --message_dim                Dimension of the messages
-  --memory_dim                 Dimension of the memory
-  --backprop_every             Number of batches to process before performing backpropagation
-  --different_new_nodes        Whether to use different unseen nodes for validation and testing
-  --uniform                    Whether to sample the temporal neighbors uniformly (or instead take the most recent ones)
-  --randomize_features         Whether to randomize node features
-  --dyrep                      Whether to run the model as DyRep
+```powershell
+..\.venv\Scripts\python.exe utils\preprocess_polymarket.py `
+  --data-root C:/Users/User/Downloads/poly_data `
+  --output-dir ./data `
+  --output-name polymarket_4h_verified `
+  --timeframe 4h `
+  --min-market-volume 10000 `
+  --max-edge-rows 1000000 `
+  --progress-every 100 `
+  --include-topic-edges `
+  --include-complement-edges `
+  --verified-pairs-csv C:/path/to/verified_pairs.csv
 ```
 
-## TODOs 
-* Make code memory efficient: for the sake of simplicity, the memory module of the TGN model is 
-implemented as a parameter (so that it is stored and loaded together of the model). However, this 
-does not need to be the case, and 
-more efficient implementations which treat the models as just tensors (in the same way as the 
-input features) would be more amenable to large graphs.
+If you do not have a verifier CSV yet, omit `--verified-pairs-csv`.
 
-## Cite us
+The output files follow the TGN format:
+
+```text
+data/ml_<output-name>.csv
+data/ml_<output-name>.npy
+data/ml_<output-name>_node.npy
+data/ml_<output-name>_metadata.json
+```
+
+## Verifier CSV Format
+
+Market-level dependency labels may use:
+
+```csv
+source_condition_id,target_condition_id,label,relation_type,timestamp
+```
+
+Token-level dependency labels may use:
+
+```csv
+source_token_id,target_token_id,label,relation_type,timestamp
+```
+
+You can also identify token rows by condition/outcome pairs:
+
+```csv
+source_condition_id,source_outcome,target_condition_id,target_outcome,label,relation_type,timestamp
+```
+
+Supported relation labels are encoded into edge features, including implication, contradiction,
+equivalence, mutual exclusion, and other.
+
+## Training
+
+Self-supervised temporal link prediction:
+
+```powershell
+..\.venv\Scripts\python.exe train_self_supervised.py `
+  -d polymarket_4h `
+  --use_memory `
+  --prefix poly-4h-small `
+  --negative_sampler typed_temporal `
+  --n_epoch 2 `
+  --bs 100 `
+  --n_degree 5 `
+  --progress_every_batches 25
+```
+
+Useful options:
+
+- `--negative_sampler typed_temporal`: samples type-compatible temporal negatives.
+- `--progress_every_batches`: prints training progress during long CPU runs.
+- `--memory_dim`: can be omitted; the code uses the node feature dimension automatically.
+- `--strict_memory_check`: re-enables strict TGN memory drift assertions for debugging.
+
+The self-supervised ground truth is edge existence: observed temporal edges are positive examples,
+and sampled non-edges are negative examples. This is useful for learning temporal graph structure,
+but it is not the same as training directly on verified arbitrage labels.
+
+## Interpreting Results
+
+High AP/AUC in self-supervised training means the model can distinguish observed edges from sampled
+negative edges. On the current market-token graph, this is a pipeline sanity check rather than proof
+of arbitrage discovery.
+
+For the research objective, the more meaningful evaluation is candidate ranking against verifier
+labels:
+
+- Does the model rank verifier-positive market/token pairs above verifier-negative or unknown pairs?
+- Are high-scoring token-token candidates logically plausible?
+- Are high-scoring pairs economically meaningful after fees, spreads, and liquidity constraints?
+
+The helper functions in `evaluation/evaluation.py` include Polymarket candidate scoring utilities
+for this later verifier-centered evaluation.
+
+## Files Added or Adapted for Polymarket
+
+- `utils/preprocess_polymarket.py`: converts raw Polymarket metadata, OHLCV, optional orderbooks,
+  and optional verifier labels into TGN input files.
+- `utils/utils.py`: includes a typed temporal negative sampler for heterogeneous Polymarket nodes.
+- `evaluation/evaluation.py`: includes helpers for scoring/ranking Polymarket candidate edges.
+- `train_self_supervised.py`: adds Polymarket-friendly progress logging, typed negatives, and
+  automatic memory dimension handling.
+- `train_supervised.py`: aligns memory dimension and memory checking behavior with the
+  self-supervised script.
+- `model/tgn.py`: adds optional relaxed memory drift handling for long Polymarket runs.
+
+## Suggested Research Path
+
+1. Build a small smoke-test graph and inspect `ml_<name>_metadata.json`.
+2. Train for 1-2 epochs to confirm the pipeline runs.
+3. Build the rich graph with topic and complement edges.
+4. Add verifier-labeled dependency edges.
+5. Evaluate ranking quality on held-out verified pairs.
+6. Use high-ranking unverified token-token or market-market pairs as symbolic-verifier candidates.
+
+## Citation
+
+If citing the underlying architecture, cite the original TGN paper:
 
 ```bibtex
 @inproceedings{tgn_icml_grl2020,
     title={Temporal Graph Networks for Deep Learning on Dynamic Graphs},
-    author={Emanuele Rossi and Ben Chamberlain and Fabrizio Frasca and Davide Eynard and Federico 
+    author={Emanuele Rossi and Ben Chamberlain and Fabrizio Frasca and Davide Eynard and Federico
     Monti and Michael Bronstein},
     booktitle={ICML 2020 Workshop on Graph Representation Learning},
     year={2020}
 }
 ```
-
-
